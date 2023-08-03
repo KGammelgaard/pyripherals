@@ -197,6 +197,79 @@ class I2CController:
 
         print('Timeout Exception in Rx')
 
+    def i2c_repeat_receive(self, devAddr, regAddr, data_length):
+        """Load commands and execute 244 identical i2c reads,  readout from the FIFO
+
+            Parameters
+            ----------
+            devAddr : int
+                8 bit address (don't set the read bit (LSB) since this is done in this function)
+            regAddr : int
+                Written to device (this is a list and must be even if length 1)
+            data_length : int
+                Number of bytes expected to receive.
+
+            Returns
+            -------
+            data or buf, e : list or bytearray, int
+                The data or a bytearray and error code, depending on whether data_transfer was 'wire' or 'pipe'.
+            """
+
+        if (regAddr == None) or (regAddr == [None]):
+            # for chips without register addresses -- just a single register
+            preamble = [devAddr | 0x01]
+            # self.i2c_configure(1, 0x01, 0x00, preamble)
+            self.i2c_configure(1, 0x00, 0x00, preamble)  # no starts needed
+
+        else:
+            preamble = [devAddr & 0xfe] + regAddr + [devAddr | 0x01]
+            # signature: i2c_configure(data_length, starts (a one for each byte that gets a start), stops, preamble):
+            start_positions = 0x01 << len(regAddr)
+            self.i2c_configure(len(preamble), start_positions, 0x00, preamble)
+
+        try:
+            self.endpoints['FIFO_RESET']
+            self.endpoints['PIPE_OUT']
+        except KeyError as e:
+            raise KeyError(
+                'i2c_receive requires the I2C endpoints FIFO_RESET and PIPE_OUT. One or both are missing.')
+
+        self.fpga.xem.ActivateTriggerIn(self.endpoints['FIFO_RESET'].address,
+                                        self.endpoints['FIFO_RESET'].bit_index_low)
+
+        self.i2c['m_pBuf'][0] |= 0x80
+        self.i2c['m_pBuf'][3] = data_length
+
+        # Reset the memory pointer and transfer the buffer.
+        self.fpga.xem.ActivateTriggerIn(
+            self.endpoints['MEMSTART'].address, self.endpoints['MEMSTART'].bit_index_low)
+
+        for i in range(self.i2c['m_nDataStart']):
+            # print('WireIn Value = {}'.format(self.i2c['m_pBuf'][i]))
+            mask = 0xff << self.endpoints['IN'].bit_index_low
+            value = self.i2c['m_pBuf'][i] << self.endpoints['IN'].bit_index_low
+            self.fpga.xem.SetWireInValue(
+                self.endpoints['IN'].address, value, mask)
+            self.fpga.xem.UpdateWireIns()
+            self.fpga.xem.ActivateTriggerIn(
+                self.endpoints['MEMWRITE'].address, self.endpoints['MEMWRITE'].bit_index_low)
+
+        # Start I2C transaction
+        self.fpga.xem.ActivateTriggerIn(
+            self.endpoints['REPEAT_START'].address,
+            self.endpoints['REPEAT_START'].bit_index_low)
+
+        # Wait for transaction to finish
+        for _ in range(int(I2CController.I2C_MAX_TIMEOUT_MS * 244 / 10)):
+            self.fpga.xem.UpdateTriggerOuts()
+
+            if self.fpga.xem.IsTriggered(self.endpoints['REPEAT_DONE'].address,
+                                         (1 << self.endpoints['REPEAT_DONE'].bit_index_low)):
+                return self.fpga.read_pipe_out(self.endpoints['PIPE_OUT'].address, data_length*244)
+            time.sleep(0.01)
+
+        print('Timeout Exception in Rx')
+
     # def i2c_write8(self, devAddr, regAddr, data_length, data):
 
     #     preamble = [devAddr & 0xfe, regAddr]
